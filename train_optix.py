@@ -152,12 +152,16 @@ def main(args):
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
-        num_classes=args.num_classes
+        num_classes=args.num_classes,
+        dtype=torch.float32 if args.amp else torch.bfloat16
     )
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
     if args.grad_ckpt:
         model.enale_grad_ckpt()
+
+    if not args.amp:
+        model = model.to(torch.bfloat16)
 
     diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
     vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
@@ -186,6 +190,9 @@ def main(args):
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            # x = optix.sliced_vae(vae, x)
+            if not args.amp:
+                x = x.to(torch.bfloat16)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
             with torch.cuda.amp.autocast(enabled=args.amp):
@@ -254,7 +261,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--grad-ckpt", type=bool, default=True)
-    parser.add_argument("--amp", type=bool, default=True)
+    parser.add_argument("--grad-ckpt", action='store_true')
+    parser.add_argument("--amp", action='store_true')
     args = parser.parse_args()
     main(args)

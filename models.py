@@ -58,8 +58,8 @@ class TimestepEmbedder(nn.Module):
             embedding = torch.cat([embedding, torch.zeros_like(embedding[:, :1])], dim=-1)
         return embedding
 
-    def forward(self, t):
-        t_freq = self.timestep_embedding(t, self.frequency_embedding_size)
+    def forward(self, t, dtype):
+        t_freq = self.timestep_embedding(t, self.frequency_embedding_size).to(dtype)
         t_emb = self.mlp(t_freq)
         return t_emb
 
@@ -158,6 +158,7 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
+        dtype=torch.bfloat16
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -180,6 +181,7 @@ class DiT(nn.Module):
         self.initialize_weights()
 
         self.grad_ckpt=False
+        self.dtype = dtype
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -242,8 +244,9 @@ class DiT(nn.Module):
         t: (N,) tensor of diffusion timesteps
         y: (N,) tensor of class labels
         """
+        x = x.to(self.dtype)
         x = self.x_embedder(x) + self.pos_embed  # (N, T, D), where T = H * W / patch_size ** 2
-        t = self.t_embedder(t)                   # (N, D)
+        t = self.t_embedder(t, x.dtype)          # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         for block in self.blocks:

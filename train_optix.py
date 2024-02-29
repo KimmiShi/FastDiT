@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torchvision
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
@@ -31,7 +32,7 @@ from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
-from torchdistpackage import setup_distributed_slurm
+from torchdistpackage import setup_distributed_slurm, tpc
 
 import optix
 
@@ -126,7 +127,7 @@ def main(args):
     # Setup DDP:
     setup_distributed_slurm()
     # dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
     seed = args.global_seed * dist.get_world_size() + rank
@@ -134,6 +135,12 @@ def main(args):
     torch.cuda.set_device(device)
     print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
 
+    dp_group = None
+    sp_group=None
+    if args.sps>1:
+        tpc.setup_process_groups([('data', dist.get_world_size()//args.sps), ('sp', args.sps)])
+        dp_group = tpc.get_group('data')
+        sp_group = tpc.get_group('sp')
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -147,13 +154,39 @@ def main(args):
     else:
         logger = create_logger(None)
 
+    transform = transforms.Compose([
+        transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
+    ])
+    # dataset = ImageFolder(args.data_path, transform=transform)
+    dataset = torchvision.datasets.CIFAR10(args.data_path, transform=transform, download=True)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(dp_group),
+        rank=dist.get_rank(dp_group),
+        shuffle=True,
+        seed=args.global_seed
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
     # Create model:
     assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
     latent_size = args.image_size // 8
     model = DiT_models[args.model](
         input_size=latent_size,
         num_classes=args.num_classes,
-        dtype=torch.float32 if args.amp else torch.bfloat16
+        dtype=torch.float32 if args.amp else torch.bfloat16,
+        sequence_parallel_size=args.sps,
+        spg=sp_group,
     )
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -182,11 +215,13 @@ def main(args):
     for epoch in range(args.epochs):
         # sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for i in range(100):
-            x = torch.rand([args.local_batch_size, 3, args.image_size, args.image_size], device='cuda')
-            y = torch.arange(10,10+args.local_batch_size).cuda()
-            # x = x.to(device)
-            # y = y.to(device)
+        # for i in range(100):
+        for iter in loader:
+            x, y = iter
+            # x = torch.rand([args.batch_size, 3, args.image_size, args.image_size], device='cuda')
+            # y = torch.arange(10,10+args.batch_size).cuda()
+            x = x.to(device)
+            y = y.to(device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
@@ -221,16 +256,16 @@ def main(args):
                 running_loss = 0
                 log_steps = 0
                 start_time = time()
-                show_mem()
+                # show_mem()
 
 
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
+                        # "model": model.module.state_dict(),
                         "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
+                        # "opt": opt.state_dict(),
                         "args": args
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
@@ -254,14 +289,15 @@ if __name__ == "__main__":
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--local-batch-size", type=int, default=96)
+    # parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
+    parser.add_argument("--ckpt-every", type=int, default=500)
     parser.add_argument("--grad-ckpt", action='store_true')
     parser.add_argument("--amp", action='store_true')
+    parser.add_argument("--sps", type=int, default=1)
     args = parser.parse_args()
     main(args)

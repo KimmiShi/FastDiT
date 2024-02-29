@@ -299,7 +299,7 @@ class DiT(nn.Module):
         num_classes=1000,
         learn_sigma=True,
         dtype=torch.bfloat16,
-        sequence_parallel=False,
+        sequence_parallel_size=1,
         spg=None,
     ):
         super().__init__()
@@ -315,6 +315,9 @@ class DiT(nn.Module):
         num_patches = self.x_embedder.num_patches
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
+
+        self.sequence_parallel_size = sequence_parallel_size
+        sequence_parallel = sequence_parallel_size > 1
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,

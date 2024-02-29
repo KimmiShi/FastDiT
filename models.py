@@ -9,17 +9,35 @@
 # MAE: https://github.com/facebookresearch/mae/blob/main/models_mae.py
 # --------------------------------------------------------
 
+from typing import Any
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 import numpy as np
 import math
 from timm.models.vision_transformer import PatchEmbed, Attention, Mlp
 
+from utils import gather_forward_split_backward
 
 def modulate(x, shift, scale):
     return x * (1 + scale.unsqueeze(1)) + shift.unsqueeze(1)
 
+# def modulate(x, shift, scale, use_kernel=True):
+#     # Suppose x is (N, T, D), shift is (N, D), scale is (N, D)
+#     dtype = x.dtype
+#     # x = norm_func(x.to(torch.float32)).to(dtype)
+#     if use_kernel:
+#         try:
+#             from opendit.kernels.fused_modulate import fused_modulate
 
+#             x = fused_modulate(x, scale, shift)
+#         except ImportError:
+#             raise RuntimeError("FusedModulate kernel not available. Please install triton.")
+#     else:
+#         x = x * (scale.unsqueeze(1) + 1) + shift.unsqueeze(1)
+#     x = x.to(dtype)
+
+#     return x
 #################################################################################
 #               Embedding Layers for Timesteps and Class Labels                 #
 #################################################################################
@@ -97,6 +115,123 @@ class LabelEmbedder(nn.Module):
 #################################################################################
 #                                 Core DiT Model                                #
 #################################################################################
+from einops import rearrange
+from internlm.model import DistributedAttention
+import torch.nn.functional as F
+from flash_attn.modules.mha import (
+    CrossAttention,
+    FlashCrossAttention,
+    FlashSelfAttention,
+    SelfAttention,
+)
+from flash_attn import (
+    flash_attn_func,
+    flash_attn_kvpacked_func,
+    flash_attn_qkvpacked_func,
+    flash_attn_varlen_kvpacked_func,
+    flash_attn_varlen_qkvpacked_func,
+    flash_attn_with_kvcache,
+)
+
+class FlashAttnFuncWrapper():
+    def __init__(self, scale, attention_dropout, causal=False) -> None:
+        self.causal = causal
+        self.scale = scale
+        self.attention_dropout = attention_dropout
+    def __call__(self, q, k, v) -> Any:
+        # (batch_size, seqlen, nheads, headdim)
+        return flash_attn_func(q, k, v,
+                               dropout_p=self.attention_dropout,
+                               softmax_scale = self.scale,
+                               causal=self.causal)
+
+class MHA(nn.Module):
+    def __init__(
+            self,
+            dim: int,
+            num_heads: int = 8,
+            qkv_bias: bool = False,
+            qk_norm: bool = False,
+            attn_drop: float = 0.,
+            proj_drop: float = 0.,
+            norm_layer: nn.Module = nn.LayerNorm,
+            fused_attn: bool = True,
+            sequence_parallel: bool = False,
+            spg = None,
+    ) -> None:
+        super().__init__()
+        assert dim % num_heads == 0, 'dim should be divisible by num_heads'
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.fused_attn = fused_attn
+
+        self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
+        self.q_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.k_norm = norm_layer(self.head_dim) if qk_norm else nn.Identity()
+        self.qk_norm = qk_norm
+        self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        self.sequence_parallel = sequence_parallel
+        self.spg = spg
+
+        # FlashSelfAttention: (B, S, 3, H, D)
+        # FlashAttnFuncWrapper: (batch_size, seqlen, nheads, headdim)
+        inner_attn_cls =FlashSelfAttention if fused_attn else SelfAttention
+        if qk_norm:
+            inner_attn_cls = FlashAttnFuncWrapper if fused_attn else SelfAttention
+        self.inner_attn = inner_attn_cls(causal=False, softmax_scale=self.scale,
+                                         attention_dropout=self.attn_drop.p if self.training else 0.)
+        if sequence_parallel:
+            # DistributedAttention: [sequence, 3, head, head_dim] / [sequence, head, head_dim]
+            self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=spg, varlen=False)
+
+    def forward_original(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, C = x.shape
+        qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)    # 3, B, nh, N, hdim
+        q, k, v = qkv.unbind(0)             # B, nh, N, hdim
+        q, k = self.q_norm(q), self.k_norm(k)
+
+        if self.fused_attn:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop.p if self.training else 0.,
+            )
+        else:
+            q = q * self.scale
+            attn = q @ k.transpose(-2, -1)
+            attn = attn.softmax(dim=-1)
+            attn = self.attn_drop(attn)
+            x = attn @ v
+
+        x = x.transpose(1, 2).reshape(B, N, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, N, D = x.shape
+
+        new_shape = [B, N, 3, self.num_heads, self.head_dim]
+        qkv = self.qkv(x).reshape(*new_shape) # B, N, 3, nh, hdim
+        # qkv = qkv.permute(2,0,1,3,4)        # 3, B, N, nh, hdim
+        # q, k, v = qkv.unbind(0)             # B, N, nh, hdim
+        if self.qk_norm:
+            dim=2
+            q, k, v = qkv.unbind(qkv, dim=dim)  # B,N, 3, nh, hdim -> B,N, nh, hdim
+            q, k = self.q_norm(q), self.k_norm(k)
+            x = self.inner_attn(q=q, k=k, v=v)
+        else:
+            x = self.inner_attn(qkv)
+
+        # x: B, N, nh, hdim
+        x = x.reshape(B, N, D)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        return x
+
 
 class DiTBlock(nn.Module):
     """
@@ -105,7 +240,9 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        self.attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        # inner_attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
+        # self.attn = DistributedAttention(self.inner_attn, )
+        self.attn = MHA(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
         approx_gelu = lambda: nn.GELU(approximate="tanh")
@@ -117,7 +254,10 @@ class DiTBlock(nn.Module):
 
     def forward(self, x, c):
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-        x = x + gate_msa.unsqueeze(1) * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
+        tmp = modulate(self.norm1(x), shift_msa, scale_msa)
+        # tmp: B, S, D
+        attn_out = self.attn(tmp)
+        x = x + gate_msa.unsqueeze(1) * attn_out
         x = x + gate_mlp.unsqueeze(1) * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
         return x
 
@@ -158,7 +298,9 @@ class DiT(nn.Module):
         class_dropout_prob=0.1,
         num_classes=1000,
         learn_sigma=True,
-        dtype=torch.bfloat16
+        dtype=torch.bfloat16,
+        sequence_parallel=False,
+        spg=None,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -175,13 +317,16 @@ class DiT(nn.Module):
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
         self.blocks = nn.ModuleList([
-            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
+            DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                     sequence_parallel=sequence_parallel, spg=spg) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
 
         self.grad_ckpt=False
         self.dtype = dtype
+        self.sequence_parallel = sequence_parallel
+        self.spg = spg
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -249,11 +394,17 @@ class DiT(nn.Module):
         t = self.t_embedder(t, x.dtype)          # (N, D)
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
+        if self.sequence_parallel_size > 1:
+            x = x.chunk(self.sequence_parallel_size, dim=1)[dist.get_rank(self.spg)]
+            # N, T/sp_size, D
         for block in self.blocks:
             if self.grad_ckpt:
-                x = torch.utils.checkpoint.checkpoint(block, x, c)
+                x = torch.utils.checkpoint.checkpoint(block, x, c, use_reentrant=False)
             else:
                 x = block(x, c)                      # (N, T, D)
+
+        x = gather_forward_split_backward(x, 1, self.spg)
+
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
         return x

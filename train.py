@@ -225,7 +225,7 @@ def main(args):
         ema = optix.ShardedEMA(model, group=dp_group)
         opt, beta2_scheduler, lr_scheduler = initialize_optimizer(model=model)
         set_parallel_attr_for_all(model)
-        engine = internlm.core.Engine(model, opt, criterion=my_loss)
+        engine = internlm.core.Engine(model, opt, criterion=diffusion.training_losses_wo)
         engine.train()
     else:
         ema = optix.ShardedEMA(model, group=dp_group)
@@ -264,13 +264,12 @@ def main(args):
             model_kwargs = dict(y=y)
 
             if args.engine=='evo':
-                engine.zero_grad()
                 outputs = engine(x, t, y)
-                loss = engine.criterion(outputs, torch.rand_like(x))
+                loss = engine.criterion(model, outputs, x, t, model_kwargs)
                 engine.backward(loss)
                 engine.step()
                 ema.update(model)
-
+                engine.zero_grad()
             else:
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     loss_dict = diffusion.training_losses(model, x, t, model_kwargs)

@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+import torchvision
 from torchvision.datasets import ImageFolder
 from torchvision import transforms
 import numpy as np
@@ -26,13 +27,33 @@ from time import time
 import argparse
 import logging
 import os
-
+from utils import set_seed
 from models import DiT_models
 from diffusion import create_diffusion
 from diffusers.models import AutoencoderKL
 
-from torchdistpackage import setup_distributed_slurm
+from torchdistpackage import setup_distributed_slurm, tpc
 
+import optix
+
+
+#################################################################################
+#                             InternEVO                                         #
+#################################################################################
+
+import internlm
+from internlm.initialize import initialize_distributed_env
+from internlm.train import (  # noqa: E402
+    get_train_data_loader,
+    get_validation_data_loader,
+    initialize_llm_profile,
+    initialize_model,
+    initialize_optimizer,
+    record_current_batch_training_metrics)
+from internlm.core.context import IS_TENSOR_ZERO_PARALLEL
+def set_parallel_attr_for_all(model):
+    for param in model.parameters():
+        setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -102,7 +123,7 @@ def center_crop_arr(pil_image, image_size):
 
     scale = image_size / min(*pil_image.size)
     pil_image = pil_image.resize(
-        tuple(round(x * scale) for x in pil_image.size), resample=Image.BICUBIC
+        tuple(round(x * scale) for x in pil_image.size) #, resample=Image.BICUBIC
     )
 
     arr = np.array(pil_image)
@@ -110,6 +131,9 @@ def center_crop_arr(pil_image, image_size):
     crop_x = (arr.shape[1] - image_size) // 2
     return Image.fromarray(arr[crop_y: crop_y + image_size, crop_x: crop_x + image_size])
 
+loss_fn = torch.nn.MSELoss()
+def my_loss(output, label):
+    return loss_fn(output[:,:4], label)
 
 #################################################################################
 #                                  Training Loop                                #
@@ -122,16 +146,21 @@ def main(args):
     assert torch.cuda.is_available(), "Training currently requires at least one GPU."
 
     # Setup DDP:
-    setup_distributed_slurm()
-    # dist.init_process_group("nccl")
-    assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
+    if not args.engine=='evo':
+        setup_distributed_slurm()
+        set_seed(1024)
+    # assert args.global_batch_size % dist.get_world_size() == 0, f"Batch size must be divisible by world size."
     rank = dist.get_rank()
     device = rank % torch.cuda.device_count()
-    seed = args.global_seed * dist.get_world_size() + rank
-    torch.manual_seed(seed)
     torch.cuda.set_device(device)
-    print(f"Starting rank={rank}, seed={seed}, world_size={dist.get_world_size()}.")
+    print(f"Starting rank={rank}, world_size={dist.get_world_size()}.")
 
+    dp_group = None
+    sp_group=None
+    if args.sps>1:
+        tpc.setup_process_groups([('data', dist.get_world_size()//args.sps), ('sp', args.sps)])
+        dp_group = tpc.get_group('data')
+        sp_group = tpc.get_group('sp')
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -145,29 +174,6 @@ def main(args):
     else:
         logger = create_logger(None)
 
-    # Create model:
-    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
-    latent_size = args.image_size // 8
-    model = DiT_models[args.model](
-        input_size=latent_size,
-        num_classes=args.num_classes
-    )
-    if args.grad_ckpt:
-        model.enale_grad_ckpt()
-    # Note that parameter initialization is done within the DiT constructor
-    ema = deepcopy(model).to(device)  # Create an EMA of the model for use after training
-    requires_grad(ema, False)
-    model = DDP(model.to(device), device_ids=[rank])
-    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
-    # vae = AutoencoderKL.from_pretrained(f"stabilityai/sd-vae-ft-{args.vae}").to(device)
-    vae = AutoencoderKL.from_pretrained("/mnt/petrelfs/share_data/wangyaohui/pretrained/stable-diffusion-2-1-base", subfolder="vae").to(device)
-
-    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
-
-    # Setup optimizer (we used default Adam betas=(0.9, 0.999) and a constant learning rate of 1e-4 in our paper):
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
-
-    # Setup data:
     transform = transforms.Compose([
         transforms.Lambda(lambda pil_image: center_crop_arr(pil_image, args.image_size)),
         transforms.RandomHorizontalFlip(),
@@ -175,28 +181,61 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     # dataset = ImageFolder(args.data_path, transform=transform)
-    # sampler = DistributedSampler(
-    #     dataset,
-    #     num_replicas=dist.get_world_size(),
-    #     rank=rank,
-    #     shuffle=True,
-    #     seed=args.global_seed
-    # )
-    # loader = DataLoader(
-    #     dataset,
-    #     batch_size=int(args.global_batch_size // dist.get_world_size()),
-    #     shuffle=False,
-    #     sampler=sampler,
-    #     num_workers=args.num_workers,
-    #     pin_memory=True,
-    #     drop_last=True
-    # )
-    # logger.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    dataset = torchvision.datasets.CIFAR10(args.data_path, transform=transform, download=True)
+    sampler = DistributedSampler(
+        dataset,
+        num_replicas=dist.get_world_size(dp_group),
+        rank=dist.get_rank(dp_group),
+        shuffle=True,
+        seed=args.global_seed
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        drop_last=True
+    )
+    # Create model:
+    assert args.image_size % 8 == 0, "Image size must be divisible by 8 (for the VAE encoder)."
+    latent_size = args.image_size // 8
+    model = DiT_models[args.model](
+        input_size=latent_size,
+        num_classes=args.num_classes,
+        dtype=torch.float32 if args.amp else torch.bfloat16,
+        sequence_parallel_size=args.sps,
+        spg=sp_group,
+    ).cuda()
+    logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    if args.grad_ckpt:
+        model.enale_grad_ckpt()
+
+    if not args.amp:
+        model = model.to(torch.bfloat16)
+
+    diffusion = create_diffusion(timestep_respacing="")  # default: 1000 steps, linear noise schedule
+    vae = AutoencoderKL.from_pretrained(args.vae).to(device)
+
+    if args.engine == 'optix':
+        model, vae, opt, ema = optix.compile(model, vae, use_ema=True, dp_group=dp_group)
+    elif args.engine=='evo':
+        ema = optix.ShardedEMA(model, group=dp_group)
+        opt, beta2_scheduler, lr_scheduler = initialize_optimizer(model=model)
+        set_parallel_attr_for_all(model)
+        engine = internlm.core.Engine(model, opt, criterion=my_loss)
+        engine.train()
+    else:
+        ema = optix.ShardedEMA(model, group=dp_group)
+        opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+        model =DDP(model)
+
 
     # Prepare models for training:
-    update_ema(ema, model.module, decay=0)  # Ensure EMA is initialized with synced weights
+    ema.update(model, decay=0)
     model.train()  # important! This enables embedding dropout for classifier-free guidance
-    ema.eval()  # EMA model should always be in eval mode
     show_mem("before training")
     # Variables for monitoring/logging purposes:
     train_steps = 0
@@ -208,23 +247,39 @@ def main(args):
     for epoch in range(args.epochs):
         # sampler.set_epoch(epoch)
         logger.info(f"Beginning epoch {epoch}...")
-        for i in range(100):
-            x = torch.rand([args.local_batch_size, 3, args.image_size, args.image_size], device='cuda')
-            y = torch.arange(10,10+args.local_batch_size).cuda()
-            # x = x.to(device)
-            # y = y.to(device)
+        # for i in range(100):
+        for iter in loader:
+            x, y = iter
+            # x = torch.rand([args.batch_size, 3, args.image_size, args.image_size], device='cuda')
+            # y = torch.arange(10,10+args.batch_size).cuda()
+            x = x.to(device)
+            y = y.to(device)
             with torch.no_grad():
                 # Map input images to latent space + normalize latents:
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            # x = optix.sliced_vae(vae, x)
+            if not args.amp:
+                x = x.to(torch.bfloat16)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
             model_kwargs = dict(y=y)
-            with torch.cuda.amp.autocast(enabled=args.amp):
-                loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
-            loss = loss_dict["loss"].mean()
-            opt.zero_grad()
-            loss.backward()
-            opt.step()
-            update_ema(ema, model.module)
+
+            if args.engine=='evo':
+                engine.zero_grad()
+                outputs = engine(x, t, y)
+                loss = engine.criterion(outputs, torch.rand_like(x))
+                engine.backward(loss)
+                engine.step()
+                ema.update(model)
+
+            else:
+                with torch.cuda.amp.autocast(enabled=args.amp):
+                    loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
+                loss = loss_dict["loss"].mean()
+                loss.backward()
+                opt.step()
+                ema.update(model)
+                opt.zero_grad()
+
 
             # Log loss values:
             running_loss += loss.item()
@@ -249,11 +304,12 @@ def main(args):
 
             # Save DiT checkpoint:
             if train_steps % args.ckpt_every == 0 and train_steps > 0:
+                # ema_states = ema.state_dict()
                 if rank == 0:
                     checkpoint = {
-                        "model": model.module.state_dict(),
-                        "ema": ema.state_dict(),
-                        "opt": opt.state_dict(),
+                        # "model": model.module.state_dict(),
+                        # "ema": ema_states,
+                        # "opt": opt.state_dict(),
                         "args": args
                     }
                     checkpoint_path = f"{checkpoint_dir}/{train_steps:07d}.pt"
@@ -270,21 +326,31 @@ def main(args):
 
 if __name__ == "__main__":
     # Default args here will train DiT-XL/2 with the hyperparameters we used in our paper (except training iters).
-    parser = argparse.ArgumentParser()
+    # parser = argparse.ArgumentParser()
+    parser=internlm.get_default_parser()
+
     parser.add_argument("--data-path", type=str, required=False)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
-    parser.add_argument("--global-batch-size", type=int, default=256)
-    parser.add_argument("--local-batch-size", type=int, default=96)
+    # parser.add_argument("--global-batch-size", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=96)
     parser.add_argument("--global-seed", type=int, default=0)
-    parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
+    parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--ckpt-every", type=int, default=50_000)
-    parser.add_argument("--grad-ckpt", type=bool, default=True)
-    parser.add_argument("--amp", type=bool, default=True)
+    parser.add_argument("--ckpt-every", type=int, default=500)
+    parser.add_argument("--grad-ckpt", action='store_true')
+    parser.add_argument("--amp", action='store_true')
+    parser.add_argument("--sps", type=int, default=1)
+    parser.add_argument("--engine", type=str)
+
     args = parser.parse_args()
+
+    if args.engine=='evo':
+
+       initialize_distributed_env(config=args.config)
+
     main(args)

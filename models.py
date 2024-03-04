@@ -156,6 +156,7 @@ class MHA(nn.Module):
             proj_drop: float = 0.,
             norm_layer: nn.Module = nn.LayerNorm,
             fused_attn: bool = True,
+            dtype = torch.bfloat16,
             sequence_parallel: bool = False,
             spg = None,
     ) -> None:
@@ -164,6 +165,10 @@ class MHA(nn.Module):
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim ** -0.5
+
+        if dtype not in [torch.float16, torch.bfloat16]:
+            fused_attn = False
+            print("Disabled fused_attn since dtype: ", dtype)
         self.fused_attn = fused_attn
 
         self.qkv = nn.Linear(dim, dim * 3, bias=qkv_bias)
@@ -240,8 +245,6 @@ class DiTBlock(nn.Module):
     def __init__(self, hidden_size, num_heads, mlp_ratio=4.0, **block_kwargs):
         super().__init__()
         self.norm1 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
-        # inner_attn = Attention(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
-        # self.attn = DistributedAttention(self.inner_attn, )
         self.attn = MHA(hidden_size, num_heads=num_heads, qkv_bias=True, **block_kwargs)
         self.norm2 = nn.LayerNorm(hidden_size, elementwise_affine=False, eps=1e-6)
         mlp_hidden_dim = int(hidden_size * mlp_ratio)
@@ -321,6 +324,7 @@ class DiT(nn.Module):
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
+                     dtype = dtype,
                      sequence_parallel=sequence_parallel, spg=spg) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
@@ -406,7 +410,8 @@ class DiT(nn.Module):
             else:
                 x = block(x, c)                      # (N, T, D)
 
-        x = gather_forward_split_backward(x, 1, self.spg)
+        if self.sequence_parallel_size > 1:
+            x = gather_forward_split_backward(x, 1, self.spg)
 
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)

@@ -50,10 +50,10 @@ from internlm.train import (  # noqa: E402
     initialize_model,
     initialize_optimizer,
     record_current_batch_training_metrics)
-from internlm.core.context import IS_TENSOR_ZERO_PARALLEL
+from internlm.core.context import IS_TENSOR_ZERO_PARALLEL,IS_REPLICA_ZERO_PARALLEL
 def set_parallel_attr_for_all(model):
     for param in model.parameters():
-        setattr(param, IS_TENSOR_ZERO_PARALLEL, True)
+        setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
 #################################################################################
 #                             Training Helper Functions                         #
 #################################################################################
@@ -224,8 +224,10 @@ def main(args):
     elif args.engine=='evo':
         ema = optix.ShardedEMA(model, group=dp_group)
         opt, beta2_scheduler, lr_scheduler = initialize_optimizer(model=model)
+        # opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+        # opt =internlm.solver.optimizer.base_optimizer.BaseOptimizer(opt)
         set_parallel_attr_for_all(model)
-        engine = internlm.core.Engine(model, opt, criterion=diffusion.training_losses_wo)
+        engine = internlm.core.Engine(model, opt, criterion=diffusion.training_losses)
         engine.train()
     else:
         ema = optix.ShardedEMA(model, group=dp_group)
@@ -250,8 +252,6 @@ def main(args):
         # for i in range(100):
         for iter in loader:
             x, y = iter
-            # x = torch.rand([args.batch_size, 3, args.image_size, args.image_size], device='cuda')
-            # y = torch.arange(10,10+args.batch_size).cuda()
             x = x.to(device)
             y = y.to(device)
             with torch.no_grad():
@@ -264,12 +264,16 @@ def main(args):
             model_kwargs = dict(y=y)
 
             if args.engine=='evo':
-                outputs = engine(x, t, y)
-                loss = engine.criterion(model, outputs, x, t, model_kwargs)
+                # outputs = engine(x, t, y)
+                loss = engine.criterion(engine, x, t, model_kwargs)["loss"].mean()
+                # loss = diffusion.training_losses(model, x, t, model_kwargs)["loss"].mean()
                 engine.backward(loss)
                 engine.step()
+                # loss.backward()
+                # opt.step()
                 ema.update(model)
                 engine.zero_grad()
+                # opt.zero_grad()
             else:
                 with torch.cuda.amp.autocast(enabled=args.amp):
                     loss_dict = diffusion.training_losses(model, x, t, model_kwargs)
@@ -340,7 +344,7 @@ if __name__ == "__main__":
     parser.add_argument("--vae", type=str, default="stabilityai/sd-vae-ft-ema")  # Choice doesn't affect training
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--ckpt-every", type=int, default=500)
+    parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--grad-ckpt", action='store_true')
     parser.add_argument("--amp", action='store_true')
     parser.add_argument("--sps", type=int, default=1)

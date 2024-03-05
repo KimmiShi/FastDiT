@@ -43,6 +43,8 @@ import optix
 
 import internlm
 from internlm.initialize import initialize_distributed_env
+from internlm.core.context.parallel_context import global_context as gpc
+
 from internlm.train import (  # noqa: E402
     get_train_data_loader,
     get_validation_data_loader,
@@ -50,7 +52,7 @@ from internlm.train import (  # noqa: E402
     initialize_model,
     initialize_optimizer,
     record_current_batch_training_metrics)
-from internlm.core.context import IS_TENSOR_ZERO_PARALLEL,IS_REPLICA_ZERO_PARALLEL
+from internlm.core.context import ParallelMode, IS_TENSOR_ZERO_PARALLEL,IS_REPLICA_ZERO_PARALLEL
 def set_parallel_attr_for_all(model):
     for param in model.parameters():
         setattr(param, IS_REPLICA_ZERO_PARALLEL, True)
@@ -157,10 +159,15 @@ def main(args):
 
     dp_group = None
     sp_group=None
-    if args.sps>1:
-        tpc.setup_process_groups([('data', dist.get_world_size()//args.sps), ('sp', args.sps)])
-        dp_group = tpc.get_group('data')
-        sp_group = tpc.get_group('sp')
+    if args.sps > 1:
+        if args.engine =='evo':
+            sp_group=gpc.get_group(ParallelMode.TENSOR)
+            dp_group=gpc.get_group(ParallelMode.DATA)
+        else:
+            tpc.setup_process_groups([('data', dist.get_world_size()//args.sps), ('sp', args.sps)])
+            dp_group = tpc.get_group('data')
+            sp_group = tpc.get_group('sp')
+    set_seed(1024)
     # Setup an experiment folder:
     if rank == 0:
         os.makedirs(args.results_dir, exist_ok=True)  # Make results folder (holds all experiment subfolders)
@@ -220,14 +227,16 @@ def main(args):
     vae = AutoencoderKL.from_pretrained(args.vae).to(device)
 
     if args.engine == 'optix':
-        model, vae, opt, ema = optix.compile(model, vae, use_ema=True, dp_group=dp_group)
+        model, vae, opt, ema = optix.compile(model, vae, use_ema=True, dp_group=dp_group,
+                                             learning_rate=1e-4)
     elif args.engine=='evo':
         ema = optix.ShardedEMA(model, group=dp_group)
         opt, beta2_scheduler, lr_scheduler = initialize_optimizer(model=model)
-        # opt = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
+        # opt2 = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0)
         # opt =internlm.solver.optimizer.base_optimizer.BaseOptimizer(opt)
         set_parallel_attr_for_all(model)
-        engine = internlm.core.Engine(model, opt, criterion=diffusion.training_losses)
+        engine = internlm.core.Engine(model, opt, criterion=diffusion.training_losses,
+                                      beta2_scheduler=beta2_scheduler, lr_scheduler=lr_scheduler)
         engine.train()
     else:
         ema = optix.ShardedEMA(model, group=dp_group)
@@ -271,6 +280,7 @@ def main(args):
                 engine.step()
                 # loss.backward()
                 # opt.step()
+                # opt2.step()
                 ema.update(model)
                 engine.zero_grad()
                 # opt.zero_grad()

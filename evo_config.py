@@ -9,8 +9,8 @@ NUM_LAYER = 28
 VOCAB_SIZE = 103168
 
 parallel = dict(
-    zero1=dict(size=1),
-    tensor=dict(size=1, mode='mtp'),
+    zero1=dict(size=2),
+    tensor=dict(size=2, mode='mtp'),
     pipeline=dict(size=1, interleaved_overlap=True),
     sequence_parallel=False,
 )
@@ -67,13 +67,13 @@ hybrid_zero_optimizer = dict(
     clip_grad_norm=1.0,
 )
 
-dam = dict(
+adam = dict(
     lr=1e-4,
-    adam_beta1=0.9,
-    adam_beta2=0.95,
-    adam_beta2_c=0,
-    adam_eps=1e-8,
-    weight_decay=0.01,
+    # adam_beta1=0.9,
+    # adam_beta2=0.95,
+    # adam_beta2_c=0,
+    # adam_eps=1e-8,
+    # weight_decay=0.01,
 )
 
 lr_scheduler = dict(

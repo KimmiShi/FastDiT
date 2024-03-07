@@ -158,15 +158,15 @@ def main(args):
     print(f"Starting rank={rank}, world_size={dist.get_world_size()}.")
 
     dp_group = None
-    sp_group=None
-    if args.sps > 1:
+    attn_paralle_group=None
+    if args.attn_paralle_size > 1:
         if args.engine =='evo':
-            sp_group=gpc.get_group(ParallelMode.TENSOR)
+            attn_paralle_group=gpc.get_group(ParallelMode.TENSOR)
             dp_group=gpc.get_group(ParallelMode.DATA)
         else:
-            tpc.setup_process_groups([('data', dist.get_world_size()//args.sps), ('sp', args.sps)])
+            tpc.setup_process_groups([('data', dist.get_world_size()//args.attn_paralle_size), ('sp', args.attn_paralle_size)])
             dp_group = tpc.get_group('data')
-            sp_group = tpc.get_group('sp')
+            attn_paralle_group = tpc.get_group('sp')
     set_seed(1024)
     # Setup an experiment folder:
     if rank == 0:
@@ -212,8 +212,9 @@ def main(args):
         input_size=latent_size,
         num_classes=args.num_classes,
         dtype=torch.float32 if args.amp else torch.bfloat16,
-        sequence_parallel_size=args.sps,
-        spg=sp_group,
+        sequence_parallel_size=args.attn_paralle_size if args.seq_parallel else 1,
+        ring_attn_size = args.attn_paralle_size if args.ring_attn else 1,
+        attn_paralle_group=attn_paralle_group,
     ).cuda()
     logger.info(f"DiT Parameters: {sum(p.numel() for p in model.parameters()):,}")
 
@@ -228,7 +229,7 @@ def main(args):
 
     if args.engine == 'optix':
         model, vae, opt, ema = optix.compile(model, vae, use_ema=True, dp_group=dp_group,
-                                             learning_rate=1e-4)
+                                             learning_rate=1e-4, )
     elif args.engine=='evo':
         ema = optix.ShardedEMA(model, group=dp_group)
         opt, beta2_scheduler, lr_scheduler = initialize_optimizer(model=model)
@@ -263,10 +264,11 @@ def main(args):
             x, y = iter
             x = x.to(device)
             y = y.to(device)
-            with torch.no_grad():
-                # Map input images to latent space + normalize latents:
-                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            # x = optix.sliced_vae(vae, x)
+            # import pdb;pdb.set_trace()
+            # with torch.no_grad():
+            #     # Map input images to latent space + normalize latents:
+            #     x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            x = optix.sliced_vae(vae, x)
             if not args.amp:
                 x = x.to(torch.bfloat16)
             t = torch.randint(0, diffusion.num_timesteps, (x.shape[0],), device=device)
@@ -345,7 +347,7 @@ if __name__ == "__main__":
     parser.add_argument("--data-path", type=str, required=False)
     parser.add_argument("--results-dir", type=str, default="results")
     parser.add_argument("--model", type=str, choices=list(DiT_models.keys()), default="DiT-XL/2")
-    parser.add_argument("--image_size", type=int, choices=[256, 512], default=256)
+    parser.add_argument("--image_size", type=int, default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=1400)
     # parser.add_argument("--global-batch-size", type=int, default=256)
@@ -357,8 +359,11 @@ if __name__ == "__main__":
     parser.add_argument("--ckpt-every", type=int, default=5000)
     parser.add_argument("--grad-ckpt", action='store_true')
     parser.add_argument("--amp", action='store_true')
-    parser.add_argument("--sps", type=int, default=1)
+    parser.add_argument("--attn_paralle_size", type=int, default=1)
+    parser.add_argument("--ring_attn", action='store_true')
+    parser.add_argument("--seq_parallel", action='store_true')
     parser.add_argument("--engine", type=str)
+
 
     args = parser.parse_args()
 

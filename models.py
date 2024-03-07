@@ -133,6 +133,8 @@ from flash_attn import (
     flash_attn_with_kvcache,
 )
 
+from ring_flash_attn import ring_flash_attn_qkvpacked_func, ring_flash_attn_func
+
 class FlashAttnFuncWrapper():
     def __init__(self, scale, attention_dropout, causal=False) -> None:
         self.causal = causal
@@ -144,6 +146,22 @@ class FlashAttnFuncWrapper():
                                dropout_p=self.attention_dropout,
                                softmax_scale = self.scale,
                                causal=self.causal)
+
+class RingAttnFuncWrapper(FlashAttnFuncWrapper):
+    def __init__(self, scale, attention_dropout, causal=False, group=None,) -> None:
+        self.causal = causal
+        self.scale = scale
+        self.attention_dropout = attention_dropout
+        self.group=group
+
+    def __call__(self, q=None, k=None, v=None, qkv=None,) -> Any:
+        if qkv is not None:
+            return ring_flash_attn_qkvpacked_func(qkv, dropout_p=self.attention_dropout,
+                                                  causal=self.causal, group=self.group)
+        else:
+            return ring_flash_attn_func(q, k, v, dropout_p=self.attention_dropout,
+                                                  causal=self.causal, group=self.group)
+
 
 class MHA(nn.Module):
     def __init__(
@@ -158,7 +176,9 @@ class MHA(nn.Module):
             fused_attn: bool = True,
             dtype = torch.bfloat16,
             sequence_parallel: bool = False,
-            spg = None,
+            sequence_parallel_dtype: str = 'ulysses',
+            attn_paralle_group = None,
+            ring_attention = False,
     ) -> None:
         super().__init__()
         assert dim % num_heads == 0, 'dim should be divisible by num_heads'
@@ -179,18 +199,22 @@ class MHA(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
         self.sequence_parallel = sequence_parallel
-        self.spg = spg
-
+        self.attn_paralle_group = attn_paralle_group
+        self.ring_attention = ring_attention
         # FlashSelfAttention: (B, S, 3, H, D)
         # FlashAttnFuncWrapper: (batch_size, seqlen, nheads, headdim)
-        inner_attn_cls =FlashSelfAttention if fused_attn else SelfAttention
-        if qk_norm:
-            inner_attn_cls = FlashAttnFuncWrapper if fused_attn else SelfAttention
-        self.inner_attn = inner_attn_cls(causal=False, softmax_scale=self.scale,
-                                         attention_dropout=self.attn_drop.p if self.training else 0.)
-        if sequence_parallel:
-            # DistributedAttention: [sequence, 3, head, head_dim] / [sequence, head, head_dim]
-            self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=spg, varlen=False)
+        assert not sequence_parallel and ring_attention, "seuquence_paralllel and ring_attention can not both be True"
+        if ring_attention:
+            self.inner_attn = RingAttnFuncWrapper(self.scale, self.attn_drop.p, causal=False, group=attn_paralle_group)
+        else:
+            inner_attn_cls =FlashSelfAttention if fused_attn else SelfAttention
+            if qk_norm:
+                inner_attn_cls = FlashAttnFuncWrapper if fused_attn else SelfAttention
+            self.inner_attn = inner_attn_cls(causal=False, softmax_scale=self.scale,
+                                            attention_dropout=self.attn_drop.p if self.training else 0.)
+            if sequence_parallel:
+                # DistributedAttention: [sequence, 3, head, head_dim] / [sequence, head, head_dim]
+                self.inner_attn = DistributedAttention(self.inner_attn, sequence_process_group=attn_paralle_group, varlen=False)
 
     def forward_original(self, x: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
@@ -229,7 +253,10 @@ class MHA(nn.Module):
             q, k = self.q_norm(q), self.k_norm(k)
             x = self.inner_attn(q=q, k=k, v=v)
         else:
-            x = self.inner_attn(qkv)
+            if self.ring_attention:
+                x = self.inner_attn(qkv=qkv)
+            else:
+                x = self.inner_attn(qkv)
 
         # x: B, N, nh, hdim
         x = x.reshape(B, N, D)
@@ -303,7 +330,8 @@ class DiT(nn.Module):
         learn_sigma=True,
         dtype=torch.bfloat16,
         sequence_parallel_size=1,
-        spg=None,
+        ring_attn_size=1,
+        attn_paralle_group=None,
     ):
         super().__init__()
         self.learn_sigma = learn_sigma
@@ -319,13 +347,17 @@ class DiT(nn.Module):
         # Will use fixed sin-cos embedding:
         self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, hidden_size), requires_grad=False)
 
-        self.sequence_parallel_size = sequence_parallel_size
+        self.sequence_parallel_size = max(sequence_parallel_size, ring_attn_size)
         sequence_parallel = sequence_parallel_size > 1
+        ring_attn = ring_attn_size > 1
 
         self.blocks = nn.ModuleList([
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio,
                      dtype = dtype,
-                     sequence_parallel=sequence_parallel, spg=spg) for _ in range(depth)
+                     sequence_parallel=sequence_parallel,
+                     attn_paralle_group=attn_paralle_group,
+                     ring_attention = ring_attn,
+                     ) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
         self.initialize_weights()
@@ -333,7 +365,7 @@ class DiT(nn.Module):
         self.grad_ckpt=False
         self.dtype = dtype
         self.sequence_parallel = sequence_parallel
-        self.spg = spg
+        self.attn_paralle_group = attn_paralle_group
 
     def initialize_weights(self):
         # Initialize transformer layers:
@@ -402,16 +434,20 @@ class DiT(nn.Module):
         y = self.y_embedder(y, self.training)    # (N, D)
         c = t + y                                # (N, D)
         if self.sequence_parallel_size > 1:
-            x = x.chunk(self.sequence_parallel_size, dim=1)[dist.get_rank(self.spg)]
+            x = x.chunk(self.sequence_parallel_size, dim=1)[dist.get_rank(self.attn_paralle_group)]
             # N, T/sp_size, D
         for block in self.blocks:
+            beg=torch.cuda.memory_allocated()
             if self.grad_ckpt:
                 x = torch.utils.checkpoint.checkpoint(block, x, c, use_reentrant=False)
             else:
                 x = block(x, c)                      # (N, T, D)
+            # print("mem comsumption:", (torch.cuda.memory_allocated()-beg)/1024**3)
+            # print((torch.cuda.memory_allocated())/1024**3)
+            # import pdb;pdb.set_trace()
 
         if self.sequence_parallel_size > 1:
-            x = gather_forward_split_backward(x, 1, self.spg)
+            x = gather_forward_split_backward(x, 1, self.attn_paralle_group)
 
         x = self.final_layer(x, c)                # (N, T, patch_size ** 2 * out_channels)
         x = self.unpatchify(x)                   # (N, out_channels, H, W)
